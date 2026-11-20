@@ -18,58 +18,58 @@ const client = new MongoClient(process.env.MONGODB_URI);
 let db;
 
 async function connectDB() {
-    try {
-        await client.connect();
-        db = client.db(process.env.DATABASE_NAME);
+  try {
+    await client.connect();
+    db = client.db(process.env.DATABASE_NAME);
 
-        console.log("MongoDB Connected Successfully");
-    } catch (error) {
-        console.log("MongoDB Connection Error:", error);
-        process.exit(1);
-    }
+    console.log("MongoDB Connected Successfully");
+  } catch (error) {
+    console.log("MongoDB Connection Error:", error);
+    process.exit(1);
+  }
 }
 
 //menu items api
 app.get("/api/menu-items", async (req, res) => {
-    try {
-        const mentuItems = await db.collection("menuItems").find(
-            {status: 'approved'}).sort({createdAt: -1}).toArray();
+  try {
+    const mentuItems = await db.collection("menuItems").find(
+      { status: 'approved' }).sort({ createdAt: -1 }).toArray();
 
-        res.status(200).json({ 
-            success: true,
-            count: mentuItems.length,
-            data: mentuItems
-         });
+    res.status(200).json({
+      success: true,
+      count: mentuItems.length,
+      data: mentuItems
+    });
 
-    } catch (error) {
-        console.error("Error fetching menu items:", error);
-        res.status(500).json({ error: "Internal Server Error" });
-    }
+  } catch (error) {
+    console.error("Error fetching menu items:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
 })
 
 app.get("/api/menu-items/:id", async (req, res) => {
-    try{
-        const { id } = req.params;
-        if(!ObjectId.isValid(id)){
-            return res.status(400).json({ error: "Invalid ID format" });
-        }
-        const menuItem = await db.collection('menuItems').findOne({
-            _id : new ObjectId(id),
-            status: 'approved',
-            isAvailable: true
-        })
-
-        if(!menuItem){
-            return res.status(404).json({ error: "Menu item not found" });
-        }
-        res.status(200).json({
-            success: true,
-            data: menuItem
-        })
-    }catch(error){
-        console.error("Error fetching menu item by ID:", error);
-        res.status(500).json({ error: "Internal Server Error" });
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid ID format" });
     }
+    const menuItem = await db.collection('menuItems').findOne({
+      _id: new ObjectId(id),
+      status: 'approved',
+      isAvailable: true
+    })
+
+    if (!menuItem) {
+      return res.status(404).json({ error: "Menu item not found" });
+    }
+    res.status(200).json({
+      success: true,
+      data: menuItem
+    })
+  } catch (error) {
+    console.error("Error fetching menu item by ID:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
 })
 
 
@@ -143,6 +143,7 @@ app.post("/api/orders", async (req, res) => {
       message: message || "",
       status: "pending",
       createdAt: new Date(),
+      image: menuItem.images?.[0] || "",
     };
 
     const result = await db.collection("orders").insertOne(order);
@@ -162,7 +163,7 @@ app.post("/api/orders", async (req, res) => {
 });
 
 
-// customer dashboard overview api
+// customer api
 app.get("/api/customer/:customerId/dashboard", async (req, res) => {
   try {
     const { customerId } = req.params;
@@ -238,14 +239,66 @@ app.get("/api/customer/:customerId/dashboard", async (req, res) => {
   }
 });
 
+app.get('/api/customer/:customerId/orders', async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    if (!ObjectId.isValid(customerId)) {
+      return res.status(400).json({ error: "Invalid Customer ID" });
+    }
+
+    const orders = await db.collection('orders').
+      find({ customerId: new ObjectId(customerId) })
+      .sort({ createdAt: -1 }).toArray();
+
+    res.status(200).json({
+      success: true,
+      count: orders.length,
+      data: orders
+    });
+  } catch (error) {
+    console.error("Error fetching customer orders:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+app.get('/api/customer/:customerId/orders/:orderId', async (req, res) => {
+
+  try{
+    const { customerId, orderId } = req.params;
+    if (!ObjectId.isValid(customerId) || !ObjectId.isValid(orderId)) {
+      return res.status(400).json({ error: "Invalid Customer ID or Order ID" });
+    }
+    const order = await db.collection('orders').findOne({
+      _id: new ObjectId(orderId),
+      customerId: new ObjectId(customerId)
+    });
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+    res.status(200).json({
+      success: true,
+      data: order
+    });
+
+    res.status(200).json({
+      success: true,
+      data: order
+    });
+
+  }catch (error) {
+    console.error("Error fetching customer order by ID:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+})
+
 
 
 app.get("/", (req, res) => {
-    res.send("PizzaHub Server is Running");
+  res.send("PizzaHub Server is Running");
 });
 
 connectDB().then(() => {
-    app.listen(PORT, () => {
-        console.log(`Server running on port ${PORT}`);
-    });
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
 });
