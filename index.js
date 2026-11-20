@@ -74,7 +74,6 @@ app.get("/api/menu-items/:id", async (req, res) => {
 
 
 //order api
-
 app.post("/api/orders", async (req, res) => {
   try {
     const {
@@ -159,6 +158,83 @@ app.post("/api/orders", async (req, res) => {
   } catch (error) {
     console.error("Error creating order:", error);
     res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+
+// customer dashboard overview api
+app.get("/api/customer/:customerId/dashboard", async (req, res) => {
+  try {
+    const { customerId } = req.params;
+
+    if (!ObjectId.isValid(customerId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Customer ID",
+      });
+    }
+
+    const customerObjectId = new ObjectId(customerId);
+
+    const ordersCollection = db.collection("orders");
+
+    const [
+      totalOrders,
+      pendingOrders,
+      acceptedOrders,
+      rejectedOrders,
+      cancelledOrders,
+      recentOrders,
+    ] = await Promise.all([
+      ordersCollection.countDocuments({
+        customerId: customerObjectId,
+      }),
+
+      ordersCollection.countDocuments({
+        customerId: customerObjectId,
+        status: "pending",
+      }),
+
+      ordersCollection.countDocuments({
+        customerId: customerObjectId,
+        status: "accepted",
+      }),
+
+      ordersCollection.countDocuments({
+        customerId: customerObjectId,
+        status: "rejected",
+      }),
+
+      ordersCollection.countDocuments({
+        customerId: customerObjectId,
+        status: "cancelled",
+      }),
+
+      ordersCollection
+        .find({ customerId: customerObjectId })
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .toArray(),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        totalOrders,
+        pendingOrders,
+        acceptedOrders,
+        rejectedOrders,
+        cancelledOrders,
+        recentOrders,
+      },
+    });
+  } catch (error) {
+    console.error("Customer Dashboard Error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch customer dashboard data",
+    });
   }
 });
 
