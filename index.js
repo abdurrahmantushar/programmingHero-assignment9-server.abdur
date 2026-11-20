@@ -291,6 +291,240 @@ app.get('/api/customer/:customerId/orders/:orderId', async (req, res) => {
   }
 })
 
+app.get("/api/customer/:customerId/addresses", async (req, res) => {
+  try {
+    const { customerId } = req.params;
+
+    if (!ObjectId.isValid(customerId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Customer ID",
+      });
+    }
+
+    const addresses = await db.collection("addresses")
+      .find({ customerId: new ObjectId(customerId) })
+      .sort({ isDefault: -1, createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      count: addresses.length,
+      data: addresses,
+    });
+  } catch (error) {
+    console.error("Fetch Addresses Error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch addresses",
+    });
+  }
+});
+
+app.post("/api/customer/:customerId/addresses", async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const {
+      fullName,
+      phone,
+      address,
+      city,
+      area,
+      postalCode,
+      label,
+      isDefault,
+    } = req.body;
+
+    if (!ObjectId.isValid(customerId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Customer ID",
+      });
+    }
+
+    if (
+      !fullName?.trim() ||
+      !phone?.trim() ||
+      !address?.trim() ||
+      !city?.trim() ||
+      !area?.trim() ||
+      !postalCode?.trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide all required address fields",
+      });
+    }
+
+    const customerObjectId = new ObjectId(customerId);
+    const shouldBeDefault = Boolean(isDefault);
+
+    if (shouldBeDefault) {
+      await db.collection("addresses").updateMany(
+        { customerId: customerObjectId },
+        { $set: { isDefault: false } }
+      );
+    }
+
+    const newAddress = {
+      customerId: customerObjectId,
+      fullName: fullName.trim(),
+      phone: phone.trim(),
+      address: address.trim(),
+      city: city.trim(),
+      area: area.trim(),
+      postalCode: postalCode.trim(),
+      label: label || "Home",
+      isDefault: shouldBeDefault,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await db.collection("addresses").insertOne(newAddress);
+
+    res.status(201).json({
+      success: true,
+      message: "Address added successfully",
+      data: {
+        _id: result.insertedId,
+        ...newAddress,
+      },
+    });
+  } catch (error) {
+    console.error("Add Address Error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to add address",
+    });
+  }
+});
+
+app.put("/api/customer/:customerId/addresses/:addressId", async (req, res) => {
+  try {
+    const { customerId, addressId } = req.params;
+    const {
+      fullName,
+      phone,
+      address,
+      city,
+      area,
+      postalCode,
+      label,
+      isDefault,
+    } = req.body;
+
+    if (!ObjectId.isValid(customerId) || !ObjectId.isValid(addressId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid ID",
+      });
+    }
+
+    if (
+      !fullName?.trim() ||
+      !phone?.trim() ||
+      !address?.trim() ||
+      !city?.trim() ||
+      !area?.trim() ||
+      !postalCode?.trim()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide all required address fields",
+      });
+    }
+
+    const customerObjectId = new ObjectId(customerId);
+    const addressObjectId = new ObjectId(addressId);
+
+    const existingAddress = await db.collection("addresses").findOne({
+      _id: addressObjectId,
+      customerId: customerObjectId,
+    });
+
+    if (!existingAddress) {
+      return res.status(404).json({
+        success: false,
+        message: "Address not found",
+      });
+    }
+
+    const shouldBeDefault = Boolean(isDefault);
+
+    if (shouldBeDefault) {
+      await db.collection("addresses").updateMany(
+        { customerId: customerObjectId },
+        { $set: { isDefault: false } }
+      );
+    }
+
+    await db.collection("addresses").updateOne(
+      { _id: addressObjectId, customerId: customerObjectId },
+      {
+        $set: {
+          fullName: fullName.trim(),
+          phone: phone.trim(),
+          address: address.trim(),
+          city: city.trim(),
+          area: area.trim(),
+          postalCode: postalCode.trim(),
+          label: label || "Home",
+          isDefault: shouldBeDefault,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Address updated successfully",
+    });
+  } catch (error) {
+    console.error("Update Address Error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update address",
+    });
+  }
+});
+
+app.delete("/api/customer/:customerId/addresses/:addressId", async (req, res) => {
+  try {
+    const { customerId, addressId } = req.params;
+
+    if (!ObjectId.isValid(customerId) || !ObjectId.isValid(addressId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid ID",
+      });
+    }
+
+    const result = await db.collection("addresses").deleteOne({
+      _id: new ObjectId(addressId),
+      customerId: new ObjectId(customerId),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Address not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Address deleted successfully",
+    });
+  } catch (error) {
+    console.error("Delete Address Error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete address",
+    });
+  }
+});
+
+
 
 
 app.get("/", (req, res) => {
