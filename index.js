@@ -1504,6 +1504,97 @@ app.post("/api/vendor/:vendorId/subscription/checkout", async (req, res) => {
   }
 });
 
+app.post("/api/vendor/:vendorId/subscription/verify", async (req, res) => {
+  try {
+    const { vendorId } = req.params;
+    const { sessionId } = req.body;
+
+    if (!ObjectId.isValid(vendorId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid vendor ID",
+      });
+    }
+
+    if (!sessionId || !sessionId.startsWith("cs_")) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Stripe session ID",
+      });
+    }
+
+    const vendorObjectId = new ObjectId(vendorId);
+
+    const vendor = await db.collection("user").findOne({
+      _id: vendorObjectId,
+      role: "vendor",
+    });
+
+    if (!vendor) {
+      return res.status(404).json({
+        success: false,
+        message: "Vendor not found",
+      });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["line_items"],
+    });
+
+    if (
+      session.mode !== "payment" ||
+      session.payment_status !== "paid" ||
+      session.metadata?.vendorId !== vendorId ||
+      session.client_reference_id !== vendorId
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment verification failed",
+      });
+    }
+
+    const purchasedPrice = session.line_items?.data?.some(
+      (item) => item.price?.id === process.env.STRIPE_PREMIUM_PRICE_ID
+    );
+
+    if (!purchasedPrice) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid subscription payment",
+      });
+    }
+
+    await db.collection("user").updateOne(
+      {
+        _id: vendorObjectId,
+        role: "vendor",
+      },
+      {
+        $set: {
+          subscriptionPlan: "premium",
+          subscriptionExpiresAt: null,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Premium subscription activated successfully",
+      data: {
+        subscriptionPlan: "premium",
+      },
+    });
+  } catch (error) {
+    console.error("Subscription Verification Error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Unable to verify payment",
+    });
+  }
+});
+
 
 
 app.get("/", (req, res) => {
