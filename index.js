@@ -3,7 +3,7 @@ import express from "express";
 import { MongoClient, ObjectId } from "mongodb";
 import cors from "cors";
 import dotenv from "dotenv";
-
+import Stripe from "stripe";
 dotenv.config();
 
 const app = express();
@@ -14,6 +14,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 5000;
 
 const client = new MongoClient(process.env.MONGODB_URI);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 let db;
 
@@ -701,7 +702,807 @@ app.delete("/api/favorites/:favoriteId", async (req, res) => {
   }
 });
 
+// vendor api
 
+
+app.get("/api/vendor/:vendorId/dashboard", async (req, res) => {
+  try {
+    const { vendorId } = req.params;
+
+    if (!ObjectId.isValid(vendorId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Vendor ID",
+      });
+    }
+
+    const vendorObjectId = new ObjectId(vendorId);
+
+    const [
+      totalMenuItems,
+      pendingMenuItems,
+      approvedMenuItems,
+      rejectedMenuItems,
+      totalOrders,
+      pendingOrders,
+      acceptedOrders,
+      rejectedOrders,
+      recentOrders,
+    ] = await Promise.all([
+      db.collection("menuItems").countDocuments({
+        vendorId: vendorObjectId,
+      }),
+      db.collection("menuItems").countDocuments({
+        vendorId: vendorObjectId,
+        status: "pending",
+      }),
+      db.collection("menuItems").countDocuments({
+        vendorId: vendorObjectId,
+        status: "approved",
+      }),
+      db.collection("menuItems").countDocuments({
+        vendorId: vendorObjectId,
+        status: "rejected",
+      }),
+      db.collection("orders").countDocuments({
+        vendorId: vendorObjectId,
+      }),
+      db.collection("orders").countDocuments({
+        vendorId: vendorObjectId,
+        status: "pending",
+      }),
+      db.collection("orders").countDocuments({
+        vendorId: vendorObjectId,
+        status: "accepted",
+      }),
+      db.collection("orders").countDocuments({
+        vendorId: vendorObjectId,
+        status: "rejected",
+      }),
+      db.collection("orders")
+        .aggregate([
+          {
+            $match: {
+              vendorId: vendorObjectId,
+            },
+          },
+          {
+            $sort: {
+              createdAt: -1,
+            },
+          },
+          {
+            $limit: 5,
+          },
+          {
+            $lookup: {
+              from: "user",
+              localField: "customerId",
+              foreignField: "_id",
+              as: "customer",
+            },
+          },
+          {
+            $unwind: {
+              path: "$customer",
+              preserveNullAndEmptyArrays: true,
+            },
+          },
+          {
+            $addFields: {
+              customerName: "$customer.name",
+            },
+          },
+          {
+            $project: {
+              customer: 0,
+            },
+          },
+        ])
+        .toArray(),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        totalMenuItems,
+        pendingMenuItems,
+        approvedMenuItems,
+        rejectedMenuItems,
+        totalOrders,
+        pendingOrders,
+        acceptedOrders,
+        rejectedOrders,
+        recentOrders,
+      },
+    });
+  } catch (error) {
+    console.error("Vendor Dashboard Error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch vendor dashboard data",
+    });
+  }
+});
+
+app.get("/api/vendor/:vendorId/menu-items", async (req, res) => {
+  try {
+    const { vendorId } = req.params;
+
+    if (!ObjectId.isValid(vendorId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid vendor ID",
+      });
+    }
+
+    const vendorObjectId = new ObjectId(vendorId);
+
+    const menuItems = await db
+      .collection("menuItems")
+      .find({ vendorId: vendorObjectId })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      count: menuItems.length,
+      data: menuItems,
+    });
+  } catch (error) {
+    console.error("Error fetching vendor menu items:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Internal Server Error",
+    });
+  }
+});
+app.post("/api/vendor/:vendorId/menu-items", async (req, res) => {
+  try {
+    const { vendorId } = req.params;
+    const {
+      itemName,
+      category,
+      description,
+      price,
+      quantity,
+      location,
+      images,
+    } = req.body;
+
+    if (!ObjectId.isValid(vendorId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid vendor ID",
+      });
+    }
+
+    if (
+      !itemName ||
+      !category ||
+      !description ||
+      price === undefined ||
+      quantity === undefined ||
+      !location ||
+      !Array.isArray(images) ||
+      images.length === 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "All required fields must be provided",
+      });
+    }
+
+    if (Number(price) <= 0 || !Number.isFinite(Number(price))) {
+      return res.status(400).json({
+        success: false,
+        error: "Price must be a valid positive number",
+      });
+    }
+
+    const vendorObjectId = new ObjectId(vendorId);
+
+    const vendor = await db.collection("user").findOne({
+      _id: vendorObjectId,
+      role: "vendor",
+    });
+
+    if (!vendor) {
+      return res.status(404).json({
+        success: false,
+        error: "Vendor not found",
+      });
+    }
+
+    const subscriptionPlan = vendor.subscriptionPlan || "free";
+
+    if (subscriptionPlan !== "premium") {
+      const activeMenuItems = await db.collection("menuItems").countDocuments({
+        vendorId: vendorObjectId,
+        status: { $in: ["pending", "approved"] },
+      });
+
+      if (activeMenuItems >= 3) {
+        return res.status(403).json({
+          success: false,
+          error: "Free plan allows maximum 3 active menu items. Upgrade to Premium.",
+        });
+      }
+    }
+
+    const newMenuItem = {
+      vendorId: vendorObjectId,
+      itemName: itemName.trim(),
+      category,
+      description: description.trim(),
+      quantity: Number(quantity),
+      price: Number(price),
+      location: location.trim(),
+      images,
+      status: "pending",
+      isAvailable: true,
+      createdAt: new Date(),
+    };
+
+    const result = await db.collection("menuItems").insertOne(newMenuItem);
+
+    res.status(201).json({
+      success: true,
+      message: "Menu item added successfully. Waiting for admin approval.",
+      data: {
+        _id: result.insertedId,
+        ...newMenuItem,
+      },
+    });
+  } catch (error) {
+    console.error("Error adding vendor menu item:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Internal Server Error",
+    });
+  }
+});
+app.put("/api/vendor/:vendorId/menu-items/:itemId", async (req, res) => {
+  try {
+    const { vendorId, itemId } = req.params;
+
+    const {
+      itemName,
+      category,
+      description,
+      price,
+      quantity,
+      location,
+      images,
+      isAvailable,
+    } = req.body;
+
+    if (!ObjectId.isValid(vendorId) || !ObjectId.isValid(itemId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid vendor ID or menu item ID",
+      });
+    }
+
+    const vendorObjectId = new ObjectId(vendorId);
+    const itemObjectId = new ObjectId(itemId);
+
+    const existingItem = await db.collection("menuItems").findOne({
+      _id: itemObjectId,
+      vendorId: vendorObjectId,
+    });
+
+    if (!existingItem) {
+      return res.status(404).json({
+        success: false,
+        error: "Menu item not found",
+      });
+    }
+
+    const updateData = {};
+
+    if (itemName !== undefined) {
+      if (typeof itemName !== "string" || !itemName.trim()) {
+        return res.status(400).json({
+          success: false,
+          error: "Item name is required",
+        });
+      }
+
+      updateData.itemName = itemName.trim();
+    }
+
+    if (category !== undefined) {
+      if (typeof category !== "string" || !category.trim()) {
+        return res.status(400).json({
+          success: false,
+          error: "Category is required",
+        });
+      }
+
+      updateData.category = category.trim();
+    }
+
+    if (description !== undefined) {
+      if (typeof description !== "string" || !description.trim()) {
+        return res.status(400).json({
+          success: false,
+          error: "Description is required",
+        });
+      }
+
+      updateData.description = description.trim();
+    }
+
+    if (price !== undefined) {
+      if (!Number.isFinite(Number(price)) || Number(price) <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: "Price must be a valid positive number",
+        });
+      }
+
+      updateData.price = Number(price);
+    }
+
+    if (quantity !== undefined) {
+      if (
+        !Number.isInteger(Number(quantity)) ||
+        Number(quantity) < 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Quantity must be a non-negative integer",
+        });
+      }
+
+      updateData.quantity = Number(quantity);
+    }
+
+    if (location !== undefined) {
+      if (typeof location !== "string" || !location.trim()) {
+        return res.status(400).json({
+          success: false,
+          error: "Location is required",
+        });
+      }
+
+      updateData.location = location.trim();
+    }
+
+    if (images !== undefined) {
+      if (
+        !Array.isArray(images) ||
+        images.length === 0 ||
+        images.length > 8 ||
+        images.some((image) => typeof image !== "string" || !image.trim())
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Provide between 1 and 8 valid image URLs",
+        });
+      }
+
+      updateData.images = images;
+    }
+
+    if (isAvailable !== undefined) {
+      if (typeof isAvailable !== "boolean") {
+        return res.status(400).json({
+          success: false,
+          error: "isAvailable must be true or false",
+        });
+      }
+
+      updateData.isAvailable = isAvailable;
+    }
+
+    const needsApproval =
+      itemName !== undefined ||
+      category !== undefined ||
+      description !== undefined ||
+      price !== undefined ||
+      location !== undefined ||
+      images !== undefined;
+
+    if (needsApproval) {
+      updateData.status = "pending";
+    }
+
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "No fields provided for update",
+      });
+    }
+
+    updateData.updatedAt = new Date();
+
+    await db.collection("menuItems").updateOne(
+      {
+        _id: itemObjectId,
+        vendorId: vendorObjectId,
+      },
+      {
+        $set: updateData,
+      }
+    );
+
+    const updatedItem = await db.collection("menuItems").findOne({
+      _id: itemObjectId,
+      vendorId: vendorObjectId,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Menu item updated successfully",
+      data: updatedItem,
+    });
+  } catch (error) {
+    console.error("Error updating vendor menu item:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Internal Server Error",
+    });
+  }
+});
+app.delete("/api/vendor/:vendorId/menu-items/:itemId", async (req, res) => {
+  try {
+    const { vendorId, itemId } = req.params;
+
+    if (!ObjectId.isValid(vendorId) || !ObjectId.isValid(itemId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid vendor ID or menu item ID",
+      });
+    }
+
+    const vendorObjectId = new ObjectId(vendorId);
+    const itemObjectId = new ObjectId(itemId);
+
+    const existingItem = await db.collection("menuItems").findOne({
+      _id: itemObjectId,
+      vendorId: vendorObjectId,
+    });
+
+    if (!existingItem) {
+      return res.status(404).json({
+        success: false,
+        error: "Menu item not found",
+      });
+    }
+
+    await db.collection("menuItems").deleteOne({
+      _id: itemObjectId,
+      vendorId: vendorObjectId,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Menu item deleted successfully",
+      data: {
+        _id: itemId,
+        itemName: existingItem.itemName,
+      },
+    });
+  } catch (error) {
+    console.error("Error deleting vendor menu item:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Internal Server Error",
+    });
+  }
+});
+app.get("/api/vendor/:vendorId/orders", async (req, res) => {
+  try {
+    const { vendorId } = req.params;
+
+    if (!ObjectId.isValid(vendorId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid vendor ID",
+      });
+    }
+
+    const vendorObjectId = new ObjectId(vendorId);
+
+    const orders = await db.collection("orders")
+      .aggregate([
+        {
+          $match: {
+            vendorId: vendorObjectId,
+          },
+        },
+        {
+          $sort: {
+            createdAt: -1,
+          },
+        },
+        {
+          $lookup: {
+            from: "user",
+            localField: "customerId",
+            foreignField: "_id",
+            as: "customer",
+          },
+        },
+        {
+          $unwind: {
+            path: "$customer",
+            preserveNullAndEmptyArrays: true,
+          },
+        },
+        {
+          $project: {
+            itemId: 1,
+            itemName: 1,
+            price: 1,
+            quantity: 1,
+            totalPrice: 1,
+            deliveryDate: 1,
+            deliveryAddress: 1,
+            message: 1,
+            status: 1,
+            image: 1,
+            createdAt: 1,
+            customer: {
+              _id: "$customer._id",
+              name: "$customer.name",
+              email: "$customer.email",
+              image: "$customer.image",
+            },
+          },
+        },
+      ])
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      count: orders.length,
+      data: orders,
+    });
+  } catch (error) {
+    console.error("Error fetching vendor orders:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Internal Server Error",
+    });
+  }
+});
+app.patch("/api/vendor/:vendorId/orders/:orderId", async (req, res) => {
+  try {
+    const { vendorId, orderId } = req.params;
+    const { status } = req.body;
+
+    if (!ObjectId.isValid(vendorId) || !ObjectId.isValid(orderId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid vendor ID or order ID",
+      });
+    }
+
+    if (!["accepted", "rejected"].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: "Status must be accepted or rejected",
+      });
+    }
+
+    const vendorObjectId = new ObjectId(vendorId);
+    const orderObjectId = new ObjectId(orderId);
+
+    const existingOrder = await db.collection("orders").findOne({
+      _id: orderObjectId,
+      vendorId: vendorObjectId,
+    });
+
+    if (!existingOrder) {
+      return res.status(404).json({
+        success: false,
+        error: "Order not found",
+      });
+    }
+
+    if (existingOrder.status !== "pending") {
+      return res.status(400).json({
+        success: false,
+        error: "Only pending orders can be accepted or rejected",
+      });
+    }
+
+    const result = await db.collection("orders").updateOne(
+      {
+        _id: orderObjectId,
+        vendorId: vendorObjectId,
+        status: "pending",
+      },
+      {
+        $set: {
+          status,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.modifiedCount === 0) {
+      return res.status(409).json({
+        success: false,
+        error: "Order has already been processed",
+      });
+    }
+
+    const updatedOrder = await db.collection("orders").findOne({
+      _id: orderObjectId,
+      vendorId: vendorObjectId,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: `Order ${status} successfully`,
+      data: updatedOrder,
+    });
+  } catch (error) {
+    console.error("Error updating vendor order:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Internal Server Error",
+    });
+  }
+});
+app.get("/api/vendor/:vendorId/subscription", async (req, res) => {
+  try {
+    const { vendorId } = req.params;
+
+    if (!ObjectId.isValid(vendorId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid vendor ID",
+      });
+    }
+
+    const vendorObjectId = new ObjectId(vendorId);
+
+    const vendor = await db.collection("user").findOne(
+      { _id: vendorObjectId, role: "vendor" },
+      {
+        projection: {
+          name: 1,
+          email: 1,
+          subscriptionPlan: 1,
+          subscriptionExpiresAt: 1,
+        },
+      }
+    );
+
+    if (!vendor) {
+      return res.status(404).json({
+        success: false,
+        error: "Vendor not found",
+      });
+    }
+
+    const subscriptionPlan = vendor.subscriptionPlan || "free";
+    const isPremium = subscriptionPlan === "premium";
+
+    const totalMenuItems = await db.collection("menuItems").countDocuments({
+      vendorId: vendorObjectId,
+      status: { $in: ["pending", "approved"] },
+    });
+
+    const menuLimit = isPremium ? null : 3;
+
+    res.status(200).json({
+      success: true,
+      data: {
+        vendorId,
+        name: vendor.name,
+        email: vendor.email,
+        subscriptionPlan,
+        subscriptionExpiresAt: vendor.subscriptionExpiresAt || null,
+        totalMenuItems,
+        menuLimit,
+        remainingMenuItems: isPremium
+          ? null
+          : Math.max(0, menuLimit - totalMenuItems),
+        features: {
+          unlimitedMenuItems: isPremium,
+          featuredHomepage: isPremium,
+          premiumBadge: isPremium,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching vendor subscription:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Internal Server Error",
+    });
+  }
+});
+
+// vendor check out api
+
+app.post("/api/vendor/:vendorId/subscription/checkout", async (req, res) => {
+  try {
+    const { vendorId } = req.params;
+
+    if (!ObjectId.isValid(vendorId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid vendor ID",
+      });
+    }
+
+    if (!process.env.STRIPE_PREMIUM_PRICE_ID || !process.env.CLIENT_URL) {
+      return res.status(500).json({
+        success: false,
+        error: "Stripe or client configuration is missing",
+      });
+    }
+
+    const vendorObjectId = new ObjectId(vendorId);
+
+    const vendor = await db.collection("user").findOne({
+      _id: vendorObjectId,
+      role: "vendor",
+    });
+
+    if (!vendor) {
+      return res.status(404).json({
+        success: false,
+        error: "Vendor not found",
+      });
+    }
+
+    if (vendor.subscriptionPlan === "premium") {
+      return res.status(400).json({
+        success: false,
+        error: "You already have a Premium subscription",
+      });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: vendor.email,
+      client_reference_id: vendorId,
+      line_items: [
+        {
+          price: process.env.STRIPE_PREMIUM_PRICE_ID,
+          quantity: 1,
+        },
+      ],
+      metadata: {
+        vendorId,
+      },
+      success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Stripe checkout session created successfully",
+      data: {
+        sessionId: session.id,
+        checkoutUrl: session.url,
+      },
+    });
+  } catch (error) {
+    console.error("Error creating subscription checkout:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Unable to create checkout session",
+    });
+  }
+});
 
 
 
