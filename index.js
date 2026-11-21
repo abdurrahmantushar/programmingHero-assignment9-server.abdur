@@ -72,7 +72,6 @@ app.get("/api/menu-items/:id", async (req, res) => {
   }
 })
 
-
 //order api
 app.post("/api/orders", async (req, res) => {
   try {
@@ -161,7 +160,6 @@ app.post("/api/orders", async (req, res) => {
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
-
 
 // customer api
 app.get("/api/customer/:customerId/dashboard", async (req, res) => {
@@ -263,7 +261,7 @@ app.get('/api/customer/:customerId/orders', async (req, res) => {
 
 app.get('/api/customer/:customerId/orders/:orderId', async (req, res) => {
 
-  try{
+  try {
     const { customerId, orderId } = req.params;
     if (!ObjectId.isValid(customerId) || !ObjectId.isValid(orderId)) {
       return res.status(400).json({ error: "Invalid Customer ID or Order ID" });
@@ -285,7 +283,7 @@ app.get('/api/customer/:customerId/orders/:orderId', async (req, res) => {
       data: order
     });
 
-  }catch (error) {
+  } catch (error) {
     console.error("Error fetching customer order by ID:", error);
     res.status(500).json({ error: "Internal Server Error" });
   }
@@ -523,6 +521,186 @@ app.delete("/api/customer/:customerId/addresses/:addressId", async (req, res) =>
     });
   }
 });
+
+//customer favorite items api
+app.post("/api/favorites", async (req, res) => {
+  try {
+    const { customerId, itemId } = req.body;
+
+    if (!customerId || !itemId) {
+      return res.status(400).json({
+        success: false,
+        message: "Customer ID and Item ID are required",
+      });
+    }
+
+    if (!ObjectId.isValid(customerId) || !ObjectId.isValid(itemId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid ID format",
+      });
+    }
+
+    const menuItem = await db.collection("menuItems").findOne({
+      _id: new ObjectId(itemId),
+      status: "approved",
+      isAvailable: true,
+    });
+
+    if (!menuItem) {
+      return res.status(404).json({
+        success: false,
+        message: "Menu item not found or unavailable",
+      });
+    }
+
+    const existingFavorite = await db.collection("favorites").findOne({
+      customerId: new ObjectId(customerId),
+      itemId: new ObjectId(itemId),
+    });
+
+    if (existingFavorite) {
+      return res.status(409).json({
+        success: false,
+        message: "Already added to favorites",
+      });
+    }
+
+    const favorite = {
+      customerId: new ObjectId(customerId),
+      itemId: new ObjectId(itemId),
+      createdAt: new Date(),
+    };
+
+    const result = await db.collection("favorites").insertOne(favorite);
+
+    res.status(201).json({
+      success: true,
+      message: "Added to favorites successfully",
+      data: {
+        _id: result.insertedId,
+        ...favorite,
+      },
+    });
+  } catch (error) {
+    console.error("Add Favorite Error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to add favorite",
+    });
+  }
+});
+
+app.get("/api/customer/:customerId/favorites", async (req, res) => {
+  try {
+    const { customerId } = req.params;
+
+    if (!ObjectId.isValid(customerId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Customer ID",
+      });
+    }
+
+    const favorites = await db.collection("favorites")
+      .aggregate([
+        {
+          $match: {
+            customerId: new ObjectId(customerId),
+          },
+        },
+        {
+          $lookup: {
+            from: "menuItems",
+            localField: "itemId",
+            foreignField: "_id",
+            as: "menuItem",
+          },
+        },
+        {
+          $unwind: "$menuItem",
+        },
+        {
+          $match: {
+            "menuItem.status": "approved",
+            "menuItem.isAvailable": true,
+          },
+        },
+        {
+          $sort: {
+            createdAt: -1,
+          },
+        },
+        {
+          $project: {
+            _id: 1,
+            customerId: 1,
+            itemId: 1,
+            createdAt: 1,
+            itemName: "$menuItem.itemName",
+            category: "$menuItem.category",
+            description: "$menuItem.description",
+            price: "$menuItem.price",
+            images: "$menuItem.images",
+            location: "$menuItem.location",
+            vendorId: "$menuItem.vendorId",
+          },
+        },
+      ])
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      count: favorites.length,
+      data: favorites,
+    });
+  } catch (error) {
+    console.error("Get Favorites Error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch favorites",
+    });
+  }
+});
+
+app.delete("/api/favorites/:favoriteId", async (req, res) => {
+  try {
+    const { favoriteId } = req.params;
+
+    if (!ObjectId.isValid(favoriteId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Favorite ID",
+      });
+    }
+
+    const result = await db.collection("favorites").deleteOne({
+      _id: new ObjectId(favoriteId),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Favorite not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Removed from favorites successfully",
+    });
+  } catch (error) {
+    console.error("Remove Favorite Error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to remove favorite",
+    });
+  }
+});
+
 
 
 
