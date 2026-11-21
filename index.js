@@ -1785,6 +1785,158 @@ app.get("/api/admin/dashboard", async (req, res) => {
     });
   }
 });
+app.get("/api/admin/users", async (req, res) => {
+  try {
+    const { search = "", role = "", page = 1, limit = 10 } = req.query;
+
+    const currentPage = Math.max(1, parseInt(page) || 1);
+    const perPage = Math.min(100, Math.max(1, parseInt(limit) || 10));
+
+    const query = {};
+
+    if (role && ["admin", "vendor", "customer"].includes(role)) {
+      query.role = role;
+    }
+
+    if (search.trim()) {
+      const escapedSearch = search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+      query.$or = [
+        { name: { $regex: escapedSearch, $options: "i" } },
+        { email: { $regex: escapedSearch, $options: "i" } },
+      ];
+    }
+
+    const usersCollection = db.collection("user");
+
+    const [users, totalUsers] = await Promise.all([
+      usersCollection
+        .find(query)
+        .project({
+          name: 1,
+          email: 1,
+          role: 1,
+          subscriptionPlan: 1,
+          createdAt: 1,
+          image: 1,
+        })
+        .sort({ createdAt: -1 })
+        .skip((currentPage - 1) * perPage)
+        .limit(perPage)
+        .toArray(),
+
+      usersCollection.countDocuments(query),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        users,
+        pagination: {
+          totalUsers,
+          currentPage,
+          totalPages: Math.ceil(totalUsers / perPage),
+          limit: perPage,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Admin users fetch error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch users",
+    });
+  }
+});
+app.patch("/api/admin/users/:userId/role", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { role } = req.body;
+
+    if (!ObjectId.isValid(userId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid user ID",
+      });
+    }
+
+    if (!["customer", "vendor"].includes(role)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid role",
+      });
+    }
+
+    const usersCollection = db.collection("user");
+
+    const result = await usersCollection.updateOne(
+      {
+        _id: new ObjectId(userId),
+        role: { $in: ["customer", "vendor"] },
+      },
+      {
+        $set: { role },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "User not found or cannot update this user",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "User role updated successfully",
+    });
+  } catch (error) {
+    console.error("User role update error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to update user role",
+    });
+  }
+});
+app.delete("/api/admin/users/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!ObjectId.isValid(userId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid user ID",
+      });
+    }
+
+    const usersCollection = db.collection("user");
+
+    const result = await usersCollection.deleteOne({
+      _id: new ObjectId(userId),
+      role: { $in: ["customer", "vendor"] },
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "User not found or cannot delete this user",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "User deleted successfully",
+    });
+  } catch (error) {
+    console.error("User delete error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to delete user",
+    });
+  }
+});
+
+// admin menu api
 
 
 
