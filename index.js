@@ -1937,6 +1937,147 @@ app.delete("/api/admin/users/:userId", async (req, res) => {
 });
 
 // admin menu api
+app.get("/api/admin/menu-items", async (req, res) => {
+  try {
+    const {
+      search = "",
+      status = "",
+      page = 1,
+      limit = 10,
+    } = req.query;
+
+    const currentPage = Math.max(1, parseInt(page) || 1);
+    const perPage = Math.min(100, Math.max(1, parseInt(limit) || 10));
+
+    const query = {};
+
+    if (["pending", "approved", "rejected"].includes(status)) {
+      query.status = status;
+    }
+
+    if (search.trim()) {
+      const escapedSearch = search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+      query.$or = [
+        { name: { $regex: escapedSearch, $options: "i" } },
+        { itemName: { $regex: escapedSearch, $options: "i" } },
+      ];
+    }
+
+    const menuCollection = db.collection("menuItems");
+
+    const [menuItems, totalItems] = await Promise.all([
+      menuCollection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .skip((currentPage - 1) * perPage)
+        .limit(perPage)
+        .toArray(),
+
+      menuCollection.countDocuments(query),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        menuItems,
+        pagination: {
+          totalItems,
+          currentPage,
+          totalPages: Math.ceil(totalItems / perPage),
+          limit: perPage,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Admin menu fetch error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch menu items",
+    });
+  }
+});
+app.patch("/api/admin/menu-items/:itemId/status", async (req, res) => {
+  try {
+    const { itemId } = req.params;
+    const { status } = req.body;
+
+    if (!ObjectId.isValid(itemId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid menu item ID",
+      });
+    }
+
+    if (!["approved", "rejected"].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid menu item status",
+      });
+    }
+
+    const result = await db.collection("menuItems").updateOne(
+      { _id: new ObjectId(itemId) },
+      { $set: { status } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Menu item not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Menu item ${status} successfully`,
+    });
+  } catch (error) {
+    console.error("Admin menu status error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to update menu item status",
+    });
+  }
+});
+app.delete("/api/admin/menu-items/:itemId", async (req, res) => {
+  try {
+    const { itemId } = req.params;
+
+    if (!ObjectId.isValid(itemId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid menu item ID",
+      });
+    }
+
+    const result = await db.collection("menuItems").deleteOne({
+      _id: new ObjectId(itemId),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "Menu item not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Menu item deleted successfully",
+    });
+  } catch (error) {
+    console.error("Admin menu delete error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to delete menu item",
+    });
+  }
+});
+
+// admin order api
+
+
 
 
 
