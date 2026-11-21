@@ -2210,8 +2210,122 @@ app.get("/api/admin/orders", async (req, res) => {
   }
 });
 
+//admin setting
+app.get("/api/admin/settings", async (req, res) => {
+  try {
+    const settingsCollection = db.collection("platformSettings");
 
+    const defaultSettings = {
+      _id: "platform",
+      platformName: "PizzaHub",
+      supportEmail: "support@pizzahub.com",
+      phone: "",
+      websiteUrl: "https://pizzahub.com",
+      description: "Your favorite place to order delicious pizza.",
+      language: "English",
+      timeZone: "Asia/Dhaka",
+      maintenanceMode: false,
+      allowRegistration: true,
+      requireMenuApproval: true,
+      notifications: {
+        newUser: true,
+        newOrder: true,
+        subscription: true,
+        email: true,
+      },
+      updatedAt: new Date(),
+    };
 
+    await settingsCollection.updateOne(
+      { _id: "platform" },
+      { $setOnInsert: defaultSettings },
+      { upsert: true }
+    );
+
+    const settings = await settingsCollection.findOne({
+      _id: "platform",
+    });
+
+    res.send({
+      success: true,
+      data: settings,
+    });
+  } catch (error) {
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch settings",
+    });
+  }
+});
+app.patch("/api/admin/settings", async (req, res) => {
+  try {
+    const {
+      platformName,
+      supportEmail,
+      phone,
+      websiteUrl,
+      description,
+      language,
+      timeZone,
+      maintenanceMode,
+      allowRegistration,
+      requireMenuApproval,
+      notifications,
+    } = req.body;
+
+    const updates = {};
+
+    if (typeof platformName === "string") updates.platformName = platformName;
+    if (typeof supportEmail === "string") updates.supportEmail = supportEmail;
+    if (typeof phone === "string") updates.phone = phone;
+    if (typeof websiteUrl === "string") updates.websiteUrl = websiteUrl;
+    if (typeof description === "string") updates.description = description;
+    if (typeof language === "string") updates.language = language;
+    if (typeof timeZone === "string") updates.timeZone = timeZone;
+
+    if (typeof maintenanceMode === "boolean") updates.maintenanceMode = maintenanceMode;
+    if (typeof allowRegistration === "boolean") updates.allowRegistration = allowRegistration;
+    if (typeof requireMenuApproval === "boolean") updates.requireMenuApproval = requireMenuApproval;
+
+    if (notifications && typeof notifications === "object" && !Array.isArray(notifications)) {
+      for (const key of ["newUser", "newOrder", "subscription", "email"]) {
+        if (typeof notifications[key] === "boolean") {
+          updates[`notifications.${key}`] = notifications[key];
+        }
+      }
+    }
+
+    updates.updatedAt = new Date();
+
+    const settingsCollection = db.collection("platformSettings");
+
+    await settingsCollection.updateOne(
+      { _id: "platform" },
+      {
+        $setOnInsert: {
+          _id: "platform",
+        },
+        $set: updates,
+      },
+      { upsert: true }
+    );
+
+    const settings = await settingsCollection.findOne({
+      _id: "platform",
+    });
+
+    res.send({
+      success: true,
+      message: "Settings updated successfully",
+      data: settings,
+    });
+  } catch (error) {
+    res.status(500).send({
+      success: false,
+      message: "Failed to update settings",
+    });
+  }
+});
 
 
 
