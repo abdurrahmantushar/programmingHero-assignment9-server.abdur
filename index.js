@@ -2074,8 +2074,142 @@ app.delete("/api/admin/menu-items/:itemId", async (req, res) => {
     });
   }
 });
+app.get("/api/admin/transactions", async (req, res) => {
+  try {
+    const {
+      search = "",
+      page = 1,
+      limit = 10,
+    } = req.query;
 
+    const pageNumber = Math.max(1, parseInt(page) || 1);
+    const limitNumber = Math.max(1, parseInt(limit) || 10);
+
+    const query = {};
+
+    if (search.trim()) {
+      query.$or = [
+        { vendorName: { $regex: search, $options: "i" } },
+        { vendorEmail: { $regex: search, $options: "i" } },
+        { vendorId: { $regex: search, $options: "i" } },
+        { sessionId: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    const transactionsCollection = db.collection("transactions");
+
+    const [transactions, total] = await Promise.all([
+      transactionsCollection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .skip((pageNumber - 1) * limitNumber)
+        .limit(limitNumber)
+        .toArray(),
+
+      transactionsCollection.countDocuments(query),
+    ]);
+
+    const revenueResult = await transactionsCollection.aggregate([
+      {
+        $match: {
+          status: "paid",
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalRevenue: { $sum: "$amount" },
+        },
+      },
+    ]).toArray();
+
+    const totalRevenue = revenueResult[0]?.totalRevenue || 0;
+
+    res.send({
+      success: true,
+      data: transactions,
+      totalRevenue,
+      pagination: {
+        total,
+        page: pageNumber,
+        limit: limitNumber,
+        totalPages: Math.ceil(total / limitNumber),
+      },
+    });
+  } catch (error) {
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch transactions",
+    });
+  }
+});
 // admin order api
+app.get("/api/admin/orders", async (req, res) => {
+  try {
+    const {
+      search = "",
+      status = "",
+      page = 1,
+      limit = 10,
+    } = req.query;
+
+    const currentPage = Math.max(1, parseInt(page) || 1);
+    const perPage = Math.min(100, Math.max(1, parseInt(limit) || 10));
+
+    const query = {};
+
+    if (
+      ["pending", "accepted", "rejected", "completed", "cancelled"].includes(
+        status
+      )
+    ) {
+      query.status = status;
+    }
+
+    if (search.trim()) {
+      const escapedSearch = search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+      query.$or = [
+        { itemName: { $regex: escapedSearch, $options: "i" } },
+        { customerId: { $regex: escapedSearch, $options: "i" } },
+        { vendorId: { $regex: escapedSearch, $options: "i" } },
+      ];
+    }
+
+    const ordersCollection = db.collection("orders");
+
+    const [orders, totalOrders] = await Promise.all([
+      ordersCollection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .skip((currentPage - 1) * perPage)
+        .limit(perPage)
+        .toArray(),
+
+      ordersCollection.countDocuments(query),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        orders,
+        pagination: {
+          totalOrders,
+          currentPage,
+          totalPages: Math.ceil(totalOrders / perPage),
+          limit: perPage,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Admin orders fetch error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch orders",
+    });
+  }
+});
+
 
 
 
