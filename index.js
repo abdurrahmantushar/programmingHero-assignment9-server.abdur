@@ -48,6 +48,72 @@ app.get("/api/menu-items", async (req, res) => {
   }
 })
 
+app.get("/api/menu-items/premium-featured", async (req, res) => {
+  try {
+    const premiumItems = await db.collection("menuItems").aggregate([
+      {
+        $match: {
+          status: "approved",
+          isAvailable: true
+        }
+      },
+      {
+        $lookup: {
+          from: "user",
+          localField: "vendorId",
+          foreignField: "_id",
+          as: "vendor"
+        }
+      },
+      {
+        $unwind: "$vendor"
+      },
+      {
+        $match: {
+          "vendor.role": "vendor",
+          "vendor.subscriptionPlan": "premium"
+        }
+      },
+      {
+        $project: {
+          itemName: 1,
+          category: 1,
+          description: 1,
+          price: 1,
+          location: 1,
+          images: 1,
+          isAvailable: 1,
+          vendorId: 1,
+          vendorName: "$vendor.name",
+          subscriptionPlan: "$vendor.subscriptionPlan"
+        }
+      },
+      {
+        $sort: {
+          createdAt: -1
+        }
+      },
+      {
+        $limit: 8
+      }
+    ]).toArray();
+
+    res.status(200).json({
+      success: true,
+      count: premiumItems.length,
+      data: premiumItems
+    });
+
+  } catch (error) {
+    console.error("Error fetching premium menu items:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch premium menu items."
+    });
+  }
+});
+
 app.get("/api/menu-items/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -1564,6 +1630,25 @@ app.post("/api/vendor/:vendorId/subscription/verify", async (req, res) => {
       });
     }
 
+    const transaction = {
+      vendorId: vendorObjectId,
+      vendorName: vendor.name || "",
+      vendorEmail: vendor.email || "",
+      sessionId: session.id,
+      amount: session.amount_total,
+      currency: session.currency,
+      status: "paid",
+      createdAt: new Date(
+        (session.created || Math.floor(Date.now() / 1000)) * 1000
+      ),
+    };
+
+    await db.collection("transactions").updateOne(
+      { sessionId: session.id },
+      { $setOnInsert: transaction },
+      { upsert: true }
+    );
+
     await db.collection("user").updateOne(
       {
         _id: vendorObjectId,
@@ -1591,6 +1676,112 @@ app.post("/api/vendor/:vendorId/subscription/verify", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Unable to verify payment",
+    });
+  }
+});
+
+
+// admin api
+
+app.get("/api/admin/dashboard", async (req, res) => {
+  try {
+    const usersCollection = db.collection("user");
+    const menuCollection = db.collection("menuItems");
+    const ordersCollection = db.collection("orders");
+    const transactionsCollection = db.collection("transactions");
+
+    const [
+      totalUsers,
+      totalVendors,
+      totalCustomers,
+      premiumVendors,
+      totalMenuItems,
+      totalOrders,
+      revenueResult,
+      recentUsers,
+      recentOrders,
+    ] = await Promise.all([
+      usersCollection.countDocuments(),
+
+      usersCollection.countDocuments({
+        role: "vendor",
+      }),
+
+      usersCollection.countDocuments({
+        role: "customer",
+      }),
+
+      usersCollection.countDocuments({
+        role: "vendor",
+        subscriptionPlan: "premium",
+      }),
+
+      menuCollection.countDocuments(),
+
+      ordersCollection.countDocuments(),
+
+      transactionsCollection.aggregate([
+        {
+          $match: {
+            status: "paid",
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            totalRevenue: {
+              $sum: "$amount",
+            },
+          },
+        },
+      ]).toArray(),
+
+      usersCollection
+        .find(
+          {},
+          {
+            projection: {
+              name: 1,
+              email: 1,
+              role: 1,
+              subscriptionPlan: 1,
+              createdAt: 1,
+            },
+          }
+        )
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .toArray(),
+
+      ordersCollection
+        .find({})
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .toArray(),
+    ]);
+
+    const premiumRevenue = revenueResult[0]?.totalRevenue || 0;
+
+    res.status(200).json({
+      success: true,
+      data: {
+        totalUsers,
+        totalVendors,
+        totalCustomers,
+        totalMenuItems,
+        totalOrders,
+        premiumVendors,
+        premiumRevenue: premiumRevenue / 100,
+        recentUsers,
+        recentOrders,
+      },
+    });
+  } catch (error) {
+    console.error("Admin Dashboard Error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Internal Server Error",
     });
   }
 });
