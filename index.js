@@ -17,6 +17,54 @@ let db;
 
 const PREMIUM_DURATION_YEARS = 1;
 
+const CANONICAL_CATEGORIES = [
+  "Veg Pizza",
+  "Non-Veg Pizza",
+  "Sides",
+  "Drinks",
+  "Desserts",
+];
+
+const LEGACY_CATEGORY_MAP = {
+  Veg: "Veg Pizza",
+  "Non-Veg": "Non-Veg Pizza",
+  Special: "Sides",
+  Dessert: "Desserts",
+};
+
+const CATEGORY_BY_KEY = {};
+
+for (const category of CANONICAL_CATEGORIES) {
+  CATEGORY_BY_KEY[category.toLowerCase()] = category;
+}
+
+for (const [legacy, canonical] of Object.entries(LEGACY_CATEGORY_MAP)) {
+  CATEGORY_BY_KEY[legacy.toLowerCase()] = canonical;
+}
+
+function normalizeCategory(value) {
+  if (typeof value !== "string") return null;
+
+  const trimmed = value.trim().replace(/\s+/g, " ");
+
+  return CATEGORY_BY_KEY[trimmed.toLowerCase()] || null;
+}
+
+async function migrateLegacyCategories() {
+  for (const [legacy, canonical] of Object.entries(LEGACY_CATEGORY_MAP)) {
+    const result = await db.collection("menuItems").updateMany(
+      { category: legacy },
+      { $set: { category: canonical } }
+    );
+
+    if (result.modifiedCount > 0) {
+      console.log(
+        `Migrated ${result.modifiedCount} menu item(s) from "${legacy}" to "${canonical}"`
+      );
+    }
+  }
+}
+
 function getPremiumExpiresAt(timestampSeconds) {
   const expiresAt = new Date(Number(timestampSeconds) * 1000);
   expiresAt.setUTCFullYear(expiresAt.getUTCFullYear() + PREMIUM_DURATION_YEARS);
@@ -306,6 +354,8 @@ async function connectDB() {
       .collection("transactions")
       .createIndex({ sessionId: 1 }, { unique: true, sparse: true });
 
+    await migrateLegacyCategories();
+
     console.log("MongoDB Connected Successfully");
   } catch (error) {
     console.log("MongoDB Connection Error:", error);
@@ -505,8 +555,25 @@ const requireFavoriteOwner = async (req, res, next) => {
 //menu items api
 app.get("/api/menu-items", async (req, res) => {
   try {
-    const mentuItems = await db.collection("menuItems").find(
-      { status: 'approved' }).sort({ createdAt: -1 }).toArray();
+    const query = { status: "approved" };
+    const categoryParam =
+      typeof req.query.category === "string" ? req.query.category : "";
+
+    if (categoryParam && categoryParam.toLowerCase() !== "all") {
+      const category = normalizeCategory(categoryParam);
+
+      if (!category) {
+        return res.status(400).json({
+          success: false,
+          error: `Invalid category. Must be one of: ${CANONICAL_CATEGORIES.join(", ")}`,
+        });
+      }
+
+      query.category = category;
+    }
+
+    const mentuItems = await db.collection("menuItems").find(query)
+      .sort({ createdAt: -1 }).toArray();
 
     res.status(200).json({
       success: true,
@@ -1430,6 +1497,15 @@ app.post("/api/vendor/:vendorId/menu-items", async (req, res) => {
       });
     }
 
+    const normalizedCategory = normalizeCategory(category);
+
+    if (!normalizedCategory) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid category. Must be one of: ${CANONICAL_CATEGORIES.join(", ")}`,
+      });
+    }
+
     if (Number(price) <= 0 || !Number.isFinite(Number(price))) {
       return res.status(400).json({
         success: false,
@@ -1470,7 +1546,7 @@ app.post("/api/vendor/:vendorId/menu-items", async (req, res) => {
     const newMenuItem = {
       vendorId: vendorObjectId,
       itemName: itemName.trim(),
-      category,
+      category: normalizedCategory,
       description: description.trim(),
       quantity: Number(quantity),
       price: Number(price),
@@ -1558,7 +1634,16 @@ app.put("/api/vendor/:vendorId/menu-items/:itemId", async (req, res) => {
         });
       }
 
-      updateData.category = category.trim();
+      const normalizedCategory = normalizeCategory(category);
+
+      if (!normalizedCategory) {
+        return res.status(400).json({
+          success: false,
+          error: `Invalid category. Must be one of: ${CANONICAL_CATEGORIES.join(", ")}`,
+        });
+      }
+
+      updateData.category = normalizedCategory;
     }
 
     if (description !== undefined) {
