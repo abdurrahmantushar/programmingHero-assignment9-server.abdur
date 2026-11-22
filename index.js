@@ -8,7 +8,12 @@ dotenv.config();
 
 const app = express();
 
-app.use(cors());
+app.use(
+  cors({
+    origin: process.env.CLIENT_URL,
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
@@ -23,12 +28,206 @@ async function connectDB() {
     await client.connect();
     db = client.db(process.env.DATABASE_NAME);
 
+    await db.collection("user").updateMany(
+      { isBlocked: { $exists: false } },
+      { $set: { isBlocked: false } }
+    );
+
     console.log("MongoDB Connected Successfully");
   } catch (error) {
     console.log("MongoDB Connection Error:", error);
     process.exit(1);
   }
 }
+
+const authUnauthorized = (res, message = "Authentication required. Please login.") =>
+  res.status(401).json({
+    success: false,
+    message,
+  });
+
+const authForbidden = (res, message) =>
+  res.status(403).json({
+    success: false,
+    message,
+  });
+
+const requireAuth = async (req, res, next) => {
+  const cookie = req.headers.cookie;
+
+  if (!cookie) {
+    return authUnauthorized(res);
+  }
+
+  if (!process.env.CLIENT_URL) {
+    console.error("Authentication Middleware Error: CLIENT_URL is not configured");
+
+    return res.status(500).json({
+      success: false,
+      message: "Server authentication configuration is missing.",
+    });
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+  try {
+    const authResponse = await fetch(
+      `${process.env.CLIENT_URL.replace(/\/$/, "")}/api/auth/get-session`,
+      {
+        method: "GET",
+        headers: {
+          cookie,
+        },
+        signal: controller.signal,
+      }
+    );
+
+    if (!authResponse.ok) {
+      return authUnauthorized(res, "Invalid or expired session.");
+    }
+
+    const sessionData = await authResponse.json();
+    const user = sessionData?.user;
+
+    if (!user?.id) {
+      return authUnauthorized(res, "Invalid or expired session.");
+    }
+
+    if (user.isBlocked === true) {
+      return authForbidden(res, "Your account has been blocked.");
+    }
+
+    req.authUser = user;
+
+    next();
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      console.error("Authentication Middleware Error: session verification timed out");
+    } else {
+      console.error("Authentication Middleware Error:", error);
+    }
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to verify authentication.",
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
+const getOwnerIdFromRequest = (req, paramName) => {
+  if (req.params?.[paramName]) {
+    return req.params[paramName];
+  }
+
+  const path = (req.originalUrl || req.url || "").split("?")[0];
+  const match = path.match(/^\/api\/(?:customer|vendor)\/([^/]+)/);
+
+  return match ? decodeURIComponent(match[1]) : undefined;
+};
+
+const requireRole = (allowedRoles, message) => (req, res, next) => {
+  if (!req.authUser) {
+    return authUnauthorized(res);
+  }
+
+  if (!allowedRoles.includes(req.authUser.role)) {
+    return authForbidden(res, message);
+  }
+
+  next();
+};
+
+const requireAdmin = requireRole(["admin"], "Admin access required.");
+
+const requireCustomer = (req, res, next) => {
+  if (!req.authUser) {
+    return authUnauthorized(res);
+  }
+
+  if (req.authUser.role !== "customer") {
+    return authForbidden(res, "Customer access required.");
+  }
+
+  if (req.body && typeof req.body === "object" && !Array.isArray(req.body)) {
+    req.body.customerId = req.authUser.id;
+  }
+
+  next();
+};
+
+const requireCustomerOwner = (req, res, next) => {
+  if (!req.authUser) {
+    return authUnauthorized(res);
+  }
+
+  const customerId = getOwnerIdFromRequest(req, "customerId");
+
+  if (customerId && String(customerId) !== String(req.authUser.id)) {
+    return authForbidden(res, "You are not authorized to access this customer account.");
+  }
+
+  req.authorizedCustomerId = String(req.authUser.id);
+
+  next();
+};
+
+const requireVendorOwner = (req, res, next) => {
+  if (!req.authUser) {
+    return authUnauthorized(res);
+  }
+
+  if (req.authUser.role !== "vendor") {
+    return authForbidden(res, "Vendor access required.");
+  }
+
+  const vendorId = getOwnerIdFromRequest(req, "vendorId");
+
+  if (vendorId && String(vendorId) !== String(req.authUser.id)) {
+    return authForbidden(res, "You are not authorized to access this vendor account.");
+  }
+
+  if (req.body && typeof req.body === "object" && !Array.isArray(req.body)) {
+    req.body.vendorId = req.authUser.id;
+  }
+
+  req.authorizedVendorId = String(req.authUser.id);
+
+  next();
+};
+
+const requireFavoriteOwner = async (req, res, next) => {
+  try {
+    const { favoriteId } = req.params;
+
+    if (!ObjectId.isValid(favoriteId)) {
+      return next();
+    }
+
+    const favorite = await db.collection("favorites").findOne({
+      _id: new ObjectId(favoriteId),
+    });
+
+    if (!favorite) {
+      return next();
+    }
+
+    if (String(favorite.customerId) !== String(req.authUser.id)) {
+      return authForbidden(res, "You are not authorized to remove this favorite.");
+    }
+
+    next();
+  } catch (error) {
+    console.error("Favorite ownership check error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to verify favorite ownership.",
+    });
+  }
+};
 
 //menu items api
 app.get("/api/menu-items", async (req, res) => {
@@ -47,7 +246,6 @@ app.get("/api/menu-items", async (req, res) => {
     res.status(500).json({ error: "Internal Server Error" });
   }
 })
-
 app.get("/api/menu-items/premium-featured", async (req, res) => {
   try {
     const premiumItems = await db.collection("menuItems").aggregate([
@@ -113,7 +311,6 @@ app.get("/api/menu-items/premium-featured", async (req, res) => {
     });
   }
 });
-
 app.get("/api/menu-items/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -140,7 +337,7 @@ app.get("/api/menu-items/:id", async (req, res) => {
 })
 
 //order api
-app.post("/api/orders", async (req, res) => {
+app.post("/api/orders", requireAuth, requireCustomer, async (req, res) => {
   try {
     const {
       itemId,
@@ -229,6 +426,8 @@ app.post("/api/orders", async (req, res) => {
 });
 
 // customer api
+app.use("/api/customer", requireAuth, requireCustomer, requireCustomerOwner);
+
 app.get("/api/customer/:customerId/dashboard", async (req, res) => {
   try {
     const { customerId } = req.params;
@@ -303,7 +502,6 @@ app.get("/api/customer/:customerId/dashboard", async (req, res) => {
     });
   }
 });
-
 app.get('/api/customer/:customerId/orders', async (req, res) => {
   try {
     const { customerId } = req.params;
@@ -325,7 +523,6 @@ app.get('/api/customer/:customerId/orders', async (req, res) => {
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
-
 app.get('/api/customer/:customerId/orders/:orderId', async (req, res) => {
 
   try {
@@ -355,7 +552,6 @@ app.get('/api/customer/:customerId/orders/:orderId', async (req, res) => {
     res.status(500).json({ error: "Internal Server Error" });
   }
 })
-
 app.get("/api/customer/:customerId/addresses", async (req, res) => {
   try {
     const { customerId } = req.params;
@@ -385,7 +581,6 @@ app.get("/api/customer/:customerId/addresses", async (req, res) => {
     });
   }
 });
-
 app.post("/api/customer/:customerId/addresses", async (req, res) => {
   try {
     const { customerId } = req.params;
@@ -463,7 +658,6 @@ app.post("/api/customer/:customerId/addresses", async (req, res) => {
     });
   }
 });
-
 app.put("/api/customer/:customerId/addresses/:addressId", async (req, res) => {
   try {
     const { customerId, addressId } = req.params;
@@ -552,7 +746,6 @@ app.put("/api/customer/:customerId/addresses/:addressId", async (req, res) => {
     });
   }
 });
-
 app.delete("/api/customer/:customerId/addresses/:addressId", async (req, res) => {
   try {
     const { customerId, addressId } = req.params;
@@ -590,7 +783,7 @@ app.delete("/api/customer/:customerId/addresses/:addressId", async (req, res) =>
 });
 
 //customer favorite items api
-app.post("/api/favorites", async (req, res) => {
+app.post("/api/favorites", requireAuth, requireCustomer, async (req, res) => {
   try {
     const { customerId, itemId } = req.body;
 
@@ -658,7 +851,6 @@ app.post("/api/favorites", async (req, res) => {
     });
   }
 });
-
 app.get("/api/customer/:customerId/favorites", async (req, res) => {
   try {
     const { customerId } = req.params;
@@ -731,8 +923,12 @@ app.get("/api/customer/:customerId/favorites", async (req, res) => {
     });
   }
 });
-
-app.delete("/api/favorites/:favoriteId", async (req, res) => {
+app.delete(
+  "/api/favorites/:favoriteId",
+  requireAuth,
+  requireCustomer,
+  requireFavoriteOwner,
+  async (req, res) => {
   try {
     const { favoriteId } = req.params;
 
@@ -766,10 +962,11 @@ app.delete("/api/favorites/:favoriteId", async (req, res) => {
       message: "Failed to remove favorite",
     });
   }
-});
+  }
+);
 
 // vendor api
-
+app.use("/api/vendor", requireAuth, requireVendorOwner);
 
 app.get("/api/vendor/:vendorId/dashboard", async (req, res) => {
   try {
@@ -891,7 +1088,6 @@ app.get("/api/vendor/:vendorId/dashboard", async (req, res) => {
     });
   }
 });
-
 app.get("/api/vendor/:vendorId/menu-items", async (req, res) => {
   try {
     const { vendorId } = req.params;
@@ -1495,7 +1691,6 @@ app.get("/api/vendor/:vendorId/subscription", async (req, res) => {
 });
 
 // vendor check out api
-
 app.post("/api/vendor/:vendorId/subscription/checkout", async (req, res) => {
   try {
     const { vendorId } = req.params;
@@ -1569,7 +1764,6 @@ app.post("/api/vendor/:vendorId/subscription/checkout", async (req, res) => {
     });
   }
 });
-
 app.post("/api/vendor/:vendorId/subscription/verify", async (req, res) => {
   try {
     const { vendorId } = req.params;
@@ -1643,11 +1837,21 @@ app.post("/api/vendor/:vendorId/subscription/verify", async (req, res) => {
       ),
     };
 
-    await db.collection("transactions").updateOne(
+    const transactionResult = await db.collection("transactions").updateOne(
       { sessionId: session.id },
       { $setOnInsert: transaction },
       { upsert: true }
     );
+
+    if (transactionResult.upsertedCount === 0) {
+      return res.status(200).json({
+        success: true,
+        message: "Payment already verified",
+        data: {
+          subscriptionPlan: "premium",
+        },
+      });
+    }
 
     await db.collection("user").updateOne(
       {
@@ -1663,7 +1867,7 @@ app.post("/api/vendor/:vendorId/subscription/verify", async (req, res) => {
       }
     );
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: "Premium subscription activated successfully",
       data: {
@@ -1673,7 +1877,7 @@ app.post("/api/vendor/:vendorId/subscription/verify", async (req, res) => {
   } catch (error) {
     console.error("Subscription Verification Error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: "Unable to verify payment",
     });
@@ -1682,6 +1886,7 @@ app.post("/api/vendor/:vendorId/subscription/verify", async (req, res) => {
 
 
 // admin api
+app.use("/api/admin", requireAuth, requireAdmin);
 
 app.get("/api/admin/dashboard", async (req, res) => {
   try {
@@ -1819,6 +2024,7 @@ app.get("/api/admin/users", async (req, res) => {
           subscriptionPlan: 1,
           createdAt: 1,
           image: 1,
+          isBlocked: 1,
         })
         .sort({ createdAt: -1 })
         .skip((currentPage - 1) * perPage)
@@ -1895,6 +2101,56 @@ app.patch("/api/admin/users/:userId/role", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "Failed to update user role",
+    });
+  }
+});
+app.patch("/api/admin/users/:userId/block", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { isBlocked } = req.body;
+
+    if (!ObjectId.isValid(userId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid user ID",
+      });
+    }
+
+    if (typeof isBlocked !== "boolean") {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid block status",
+      });
+    }
+
+    if (String(userId) === String(req.authUser.id)) {
+      return res.status(400).json({
+        success: false,
+        error: "You cannot change your own block status.",
+      });
+    }
+
+    const result = await db.collection("user").updateOne(
+      { _id: new ObjectId(userId) },
+      { $set: { isBlocked } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "User not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `User ${isBlocked ? "blocked" : "unblocked"} successfully`,
+    });
+  } catch (error) {
+    console.error("User block status update error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to update user block status",
     });
   }
 });
