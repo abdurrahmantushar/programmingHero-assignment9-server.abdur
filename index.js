@@ -4,6 +4,10 @@ import { MongoClient, ObjectId } from "mongodb";
 import cors from "cors";
 import dotenv from "dotenv";
 import Stripe from "stripe";
+import verifyToken from "./verifyToken.js";
+import verifyRole from "./verifyRole.js";
+import verifyOwnership from "./verifyOwnership.js";
+import verifyBlockedUser from "./verifyBlockedUser.js";
 dotenv.config();
 
 const app = express();
@@ -344,6 +348,7 @@ async function connectDB() {
   try {
     await client.connect();
     db = client.db(process.env.DATABASE_NAME);
+    app.locals.db = db;
 
     await db.collection("user").updateMany(
       { isBlocked: { $exists: false } },
@@ -363,194 +368,24 @@ async function connectDB() {
   }
 }
 
-const authUnauthorized = (res, message = "Authentication required. Please login.") =>
-  res.status(401).json({
-    success: false,
-    message,
-  });
+const requireCustomerRole = verifyRole(["customer"], "Customer access required.");
+const requireVendorRole = verifyRole(["vendor"], "Vendor access required.");
+const requireAdminRole = verifyRole(["admin"], "Admin access required.");
 
-const authForbidden = (res, message) =>
-  res.status(403).json({
-    success: false,
-    message,
-  });
+const requireCustomerOwnership = verifyOwnership({
+  paramName: "customerId",
+  message: "You are not authorized to access this customer account.",
+});
 
-const requireAuth = async (req, res, next) => {
-  const cookie = req.headers.cookie;
+const requireVendorOwnership = verifyOwnership({
+  paramName: "vendorId",
+  message: "You are not authorized to access this vendor account.",
+});
 
-  if (!cookie) {
-    return authUnauthorized(res);
-  }
-
-  if (!process.env.CLIENT_URL) {
-    console.error("Authentication Middleware Error: CLIENT_URL is not configured");
-
-    return res.status(500).json({
-      success: false,
-      message: "Server authentication configuration is missing.",
-    });
-  }
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-  try {
-    const authResponse = await fetch(
-      `${process.env.CLIENT_URL.replace(/\/$/, "")}/api/auth/get-session`,
-      {
-        method: "GET",
-        headers: {
-          cookie,
-        },
-        signal: controller.signal,
-      }
-    );
-
-    if (!authResponse.ok) {
-      return authUnauthorized(res, "Invalid or expired session.");
-    }
-
-    const sessionData = await authResponse.json();
-    const user = sessionData?.user;
-
-    if (!user?.id) {
-      return authUnauthorized(res, "Invalid or expired session.");
-    }
-
-    if (user.isBlocked === true) {
-      return authForbidden(res, "Your account has been blocked.");
-    }
-
-    req.authUser = user;
-
-    next();
-  } catch (error) {
-    if (error?.name === "AbortError") {
-      console.error("Authentication Middleware Error: session verification timed out");
-    } else {
-      console.error("Authentication Middleware Error:", error);
-    }
-
-    return res.status(500).json({
-      success: false,
-      message: "Unable to verify authentication.",
-    });
-  } finally {
-    clearTimeout(timeoutId);
-  }
-};
-
-const getOwnerIdFromRequest = (req, paramName) => {
-  if (req.params?.[paramName]) {
-    return req.params[paramName];
-  }
-
-  const path = (req.originalUrl || req.url || "").split("?")[0];
-  const match = path.match(/^\/api\/(?:customer|vendor)\/([^/]+)/);
-
-  return match ? decodeURIComponent(match[1]) : undefined;
-};
-
-const requireRole = (allowedRoles, message) => (req, res, next) => {
-  if (!req.authUser) {
-    return authUnauthorized(res);
-  }
-
-  if (!allowedRoles.includes(req.authUser.role)) {
-    return authForbidden(res, message);
-  }
-
-  next();
-};
-
-const requireAdmin = requireRole(["admin"], "Admin access required.");
-
-const requireCustomer = (req, res, next) => {
-  if (!req.authUser) {
-    return authUnauthorized(res);
-  }
-
-  if (req.authUser.role !== "customer") {
-    return authForbidden(res, "Customer access required.");
-  }
-
-  if (req.body && typeof req.body === "object" && !Array.isArray(req.body)) {
-    req.body.customerId = req.authUser.id;
-  }
-
-  next();
-};
-
-const requireCustomerOwner = (req, res, next) => {
-  if (!req.authUser) {
-    return authUnauthorized(res);
-  }
-
-  const customerId = getOwnerIdFromRequest(req, "customerId");
-
-  if (customerId && String(customerId) !== String(req.authUser.id)) {
-    return authForbidden(res, "You are not authorized to access this customer account.");
-  }
-
-  req.authorizedCustomerId = String(req.authUser.id);
-
-  next();
-};
-
-const requireVendorOwner = (req, res, next) => {
-  if (!req.authUser) {
-    return authUnauthorized(res);
-  }
-
-  if (req.authUser.role !== "vendor") {
-    return authForbidden(res, "Vendor access required.");
-  }
-
-  const vendorId = getOwnerIdFromRequest(req, "vendorId");
-
-  if (vendorId && String(vendorId) !== String(req.authUser.id)) {
-    return authForbidden(res, "You are not authorized to access this vendor account.");
-  }
-
-  if (req.body && typeof req.body === "object" && !Array.isArray(req.body)) {
-    req.body.vendorId = req.authUser.id;
-  }
-
-  req.authorizedVendorId = String(req.authUser.id);
-
-  next();
-};
-
-const requireFavoriteOwner = async (req, res, next) => {
-  try {
-    const { favoriteId } = req.params;
-
-    if (!ObjectId.isValid(favoriteId)) {
-      return next();
-    }
-
-    const favorite = await db.collection("favorites").findOne({
-      _id: new ObjectId(favoriteId),
-    });
-
-    if (!favorite) {
-      return next();
-    }
-
-    if (String(favorite.customerId) !== String(req.authUser.id)) {
-      return authForbidden(res, "You are not authorized to remove this favorite.");
-    }
-
-    next();
-  } catch (error) {
-    console.error("Favorite ownership check error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to verify favorite ownership.",
-    });
-  }
-};
+const requireFavoriteOwnership = verifyOwnership({
+  resource: "favorite",
+  message: "You are not authorized to remove this favorite.",
+});
 
 //menu items api
 app.get("/api/menu-items", async (req, res) => {
@@ -677,7 +512,13 @@ app.get("/api/menu-items/:id", async (req, res) => {
 })
 
 //order api
-app.post("/api/orders", requireAuth, requireCustomer, async (req, res) => {
+app.post(
+  "/api/orders",
+  verifyToken,
+  requireCustomerRole,
+  requireCustomerOwnership,
+  verifyBlockedUser,
+  async (req, res) => {
   try {
     const {
       itemId,
@@ -766,7 +607,13 @@ app.post("/api/orders", requireAuth, requireCustomer, async (req, res) => {
 });
 
 // customer api
-app.use("/api/customer", requireAuth, requireCustomer, requireCustomerOwner);
+app.use(
+  "/api/customer",
+  verifyToken,
+  requireCustomerRole,
+  requireCustomerOwnership,
+  verifyBlockedUser
+);
 
 app.get("/api/customer/:customerId/dashboard", async (req, res) => {
   try {
@@ -1123,7 +970,13 @@ app.delete("/api/customer/:customerId/addresses/:addressId", async (req, res) =>
 });
 
 //customer favorite items api
-app.post("/api/favorites", requireAuth, requireCustomer, async (req, res) => {
+app.post(
+  "/api/favorites",
+  verifyToken,
+  requireCustomerRole,
+  requireCustomerOwnership,
+  verifyBlockedUser,
+  async (req, res) => {
   try {
     const { customerId, itemId } = req.body;
 
@@ -1265,9 +1118,10 @@ app.get("/api/customer/:customerId/favorites", async (req, res) => {
 });
 app.delete(
   "/api/favorites/:favoriteId",
-  requireAuth,
-  requireCustomer,
-  requireFavoriteOwner,
+  verifyToken,
+  requireCustomerRole,
+  requireFavoriteOwnership,
+  verifyBlockedUser,
   async (req, res) => {
   try {
     const { favoriteId } = req.params;
@@ -1306,7 +1160,13 @@ app.delete(
 );
 
 // vendor api
-app.use("/api/vendor", requireAuth, requireVendorOwner);
+app.use(
+  "/api/vendor",
+  verifyToken,
+  requireVendorRole,
+  requireVendorOwnership,
+  verifyBlockedUser
+);
 
 app.get("/api/vendor/:vendorId/dashboard", async (req, res) => {
   try {
@@ -2254,7 +2114,7 @@ app.post("/api/vendor/:vendorId/subscription/verify", async (req, res) => {
 
 
 // admin api
-app.use("/api/admin", requireAuth, requireAdmin);
+app.use("/api/admin", verifyToken, requireAdminRole, verifyBlockedUser);
 
 app.get("/api/admin/dashboard", async (req, res) => {
   try {
