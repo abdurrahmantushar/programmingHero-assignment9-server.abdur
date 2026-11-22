@@ -8,6 +8,282 @@ dotenv.config();
 
 const app = express();
 
+const PORT = process.env.PORT || 5000;
+
+const client = new MongoClient(process.env.MONGODB_URI);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+let db;
+
+const PREMIUM_DURATION_YEARS = 1;
+
+function getPremiumExpiresAt(timestampSeconds) {
+  const expiresAt = new Date(Number(timestampSeconds) * 1000);
+  expiresAt.setUTCFullYear(expiresAt.getUTCFullYear() + PREMIUM_DURATION_YEARS);
+  return expiresAt;
+}
+
+function validatePremiumCheckoutSession(session, vendorId, priceId) {
+  if (!session || typeof session !== "object") {
+    return "Checkout session not found";
+  }
+
+  if (session.mode !== "payment") {
+    return "Invalid checkout mode";
+  }
+
+  if (session.payment_status !== "paid") {
+    return "Payment is not paid";
+  }
+
+  if (session.metadata?.vendorId !== vendorId) {
+    return "Vendor metadata does not match";
+  }
+
+  if (session.client_reference_id !== vendorId) {
+    return "Client reference ID does not match";
+  }
+
+  const purchasedPrice = session.line_items?.data?.some(
+    (item) => item.price?.id === priceId
+  );
+
+  if (!purchasedPrice) {
+    return "Invalid subscription payment";
+  }
+
+  return null;
+}
+
+async function handleStripeWebhook(req, res) {
+  const signature = req.headers["stripe-signature"];
+
+  if (typeof signature !== "string") {
+    return res.status(400).json({
+      received: false,
+      error: "Missing Stripe signature",
+    });
+  }
+
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!webhookSecret) {
+    console.error("Stripe webhook secret is not configured");
+
+    return res.status(500).json({
+      received: false,
+      error: "Stripe webhook secret is not configured",
+    });
+  }
+
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      signature,
+      webhookSecret
+    );
+  } catch (error) {
+    console.error("Stripe webhook signature verification failed:", error.message);
+
+    return res.status(400).json({
+      received: false,
+      error: "Invalid Stripe signature",
+    });
+  }
+
+  if (event.type !== "checkout.session.completed") {
+    return res.status(200).json({
+      received: true,
+      ignored: true,
+      reason: "Unsupported event type",
+    });
+  }
+
+  const eventSession = event.data?.object;
+
+  if (!eventSession || eventSession.payment_status !== "paid") {
+    return res.status(200).json({
+      received: true,
+      ignored: true,
+      reason: "Payment is not paid",
+    });
+  }
+
+  try {
+    const priceId = process.env.STRIPE_PREMIUM_PRICE_ID;
+
+    if (!priceId) {
+      console.error("STRIPE_PREMIUM_PRICE_ID is not configured");
+
+      return res.status(500).json({
+        received: false,
+        error: "Stripe premium price is not configured",
+      });
+    }
+
+    if (
+      !event.created ||
+      !Number.isFinite(Number(event.created)) ||
+      !eventSession.id ||
+      typeof eventSession.id !== "string" ||
+      !eventSession.id.startsWith("cs_")
+    ) {
+      return res.status(400).json({
+        received: false,
+        error: "Invalid Stripe event payload",
+      });
+    }
+
+    const vendorId = eventSession.metadata?.vendorId;
+
+    if (!vendorId || !ObjectId.isValid(vendorId)) {
+      return res.status(400).json({
+        received: false,
+        error: "Invalid vendor ID",
+      });
+    }
+
+    const vendorObjectId = new ObjectId(vendorId);
+    const vendor = await db.collection("user").findOne({
+      _id: vendorObjectId,
+      role: "vendor",
+    });
+
+    if (!vendor) {
+      return res.status(400).json({
+        received: false,
+        error: "Vendor not found",
+      });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(eventSession.id, {
+      expand: ["line_items"],
+    });
+
+    const sessionValidationError = validatePremiumCheckoutSession(
+      session,
+      vendorId,
+      priceId
+    );
+
+    if (sessionValidationError) {
+      return res.status(400).json({
+        received: false,
+        error: sessionValidationError,
+      });
+    }
+
+    const configuredPrice = await stripe.prices.retrieve(priceId);
+
+    if (
+      typeof configuredPrice.unit_amount !== "number" ||
+      session.amount_total !== configuredPrice.unit_amount
+    ) {
+      return res.status(400).json({
+        received: false,
+        error: "Payment amount does not match the configured price",
+      });
+    }
+
+    if (
+      !configuredPrice.currency ||
+      !session.currency ||
+      String(configuredPrice.currency).toLowerCase() !==
+        String(session.currency).toLowerCase()
+    ) {
+      return res.status(400).json({
+        received: false,
+        error: "Payment currency does not match the configured price",
+      });
+    }
+
+    const paymentTimestampSeconds = Number(event.created);
+    const paymentDate = new Date(paymentTimestampSeconds * 1000);
+    const premiumExpiresAt = getPremiumExpiresAt(paymentTimestampSeconds);
+
+    const transaction = {
+      vendorId: vendorObjectId,
+      vendorName: vendor.name || "",
+      vendorEmail: vendor.email || "",
+      sessionId: session.id,
+      amount: session.amount_total,
+      currency: session.currency,
+      status: "paid",
+      createdAt: paymentDate,
+    };
+
+    let transactionResult;
+
+    try {
+      transactionResult = await db.collection("transactions").updateOne(
+        { sessionId: session.id },
+        { $setOnInsert: transaction },
+        { upsert: true }
+      );
+    } catch (error) {
+      if (error?.code === 11000) {
+        return res.status(200).json({
+          received: true,
+          duplicate: true,
+        });
+      }
+
+      throw error;
+    }
+
+    if (transactionResult.upsertedCount === 0) {
+      return res.status(200).json({
+        received: true,
+        duplicate: true,
+      });
+    }
+
+    try {
+      await db.collection("user").updateOne(
+        {
+          _id: vendorObjectId,
+          role: "vendor",
+        },
+        {
+          $set: {
+            subscriptionPlan: "premium",
+            subscriptionExpiresAt: premiumExpiresAt,
+            updatedAt: new Date(),
+          },
+        }
+      );
+    } catch (error) {
+      await db
+        .collection("transactions")
+        .deleteOne({ _id: transactionResult.upsertedId });
+
+      throw error;
+    }
+
+    return res.status(200).json({
+      received: true,
+      activated: true,
+      subscriptionExpiresAt: premiumExpiresAt.toISOString(),
+    });
+  } catch (error) {
+    console.error("Stripe webhook handler error:", error);
+
+    return res.status(500).json({
+      received: false,
+      error: "Unable to process Stripe webhook",
+    });
+  }
+}
+
+// Must be registered before express.json() so Stripe can verify the raw body.
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  handleStripeWebhook
+);
+
 app.use(
   cors({
     origin: process.env.CLIENT_URL,
@@ -15,13 +291,6 @@ app.use(
   })
 );
 app.use(express.json());
-
-const PORT = process.env.PORT || 5000;
-
-const client = new MongoClient(process.env.MONGODB_URI);
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-
-let db;
 
 async function connectDB() {
   try {
@@ -32,6 +301,10 @@ async function connectDB() {
       { isBlocked: { $exists: false } },
       { $set: { isBlocked: false } }
     );
+
+    await db
+      .collection("transactions")
+      .createIndex({ sessionId: 1 }, { unique: true, sparse: true });
 
     console.log("MongoDB Connected Successfully");
   } catch (error) {
@@ -1783,6 +2056,17 @@ app.post("/api/vendor/:vendorId/subscription/verify", async (req, res) => {
       });
     }
 
+    const priceId = process.env.STRIPE_PREMIUM_PRICE_ID;
+
+    if (!priceId) {
+      console.error("STRIPE_PREMIUM_PRICE_ID is not configured");
+
+      return res.status(500).json({
+        success: false,
+        message: "Stripe premium price is not configured",
+      });
+    }
+
     const vendorObjectId = new ObjectId(vendorId);
 
     const vendor = await db.collection("user").findOne({
@@ -1801,77 +2085,76 @@ app.post("/api/vendor/:vendorId/subscription/verify", async (req, res) => {
       expand: ["line_items"],
     });
 
-    if (
-      session.mode !== "payment" ||
-      session.payment_status !== "paid" ||
-      session.metadata?.vendorId !== vendorId ||
-      session.client_reference_id !== vendorId
-    ) {
+    const sessionValidationError = validatePremiumCheckoutSession(
+      session,
+      vendorId,
+      priceId
+    );
+
+    if (sessionValidationError) {
       return res.status(400).json({
         success: false,
         message: "Payment verification failed",
+        error: sessionValidationError,
       });
     }
 
-    const purchasedPrice = session.line_items?.data?.some(
-      (item) => item.price?.id === process.env.STRIPE_PREMIUM_PRICE_ID
-    );
+    const configuredPrice = await stripe.prices.retrieve(priceId);
 
-    if (!purchasedPrice) {
+    if (
+      typeof configuredPrice.unit_amount !== "number" ||
+      session.amount_total !== configuredPrice.unit_amount
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Invalid subscription payment",
+        message: "Payment amount does not match the configured price",
       });
     }
 
-    const transaction = {
-      vendorId: vendorObjectId,
-      vendorName: vendor.name || "",
-      vendorEmail: vendor.email || "",
-      sessionId: session.id,
-      amount: session.amount_total,
-      currency: session.currency,
-      status: "paid",
-      createdAt: new Date(
-        (session.created || Math.floor(Date.now() / 1000)) * 1000
-      ),
-    };
-
-    const transactionResult = await db.collection("transactions").updateOne(
-      { sessionId: session.id },
-      { $setOnInsert: transaction },
-      { upsert: true }
-    );
-
-    if (transactionResult.upsertedCount === 0) {
-      return res.status(200).json({
-        success: true,
-        message: "Payment already verified",
-        data: {
-          subscriptionPlan: "premium",
-        },
+    if (
+      !configuredPrice.currency ||
+      !session.currency ||
+      String(configuredPrice.currency).toLowerCase() !==
+        String(session.currency).toLowerCase()
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment currency does not match the configured price",
       });
     }
 
-    await db.collection("user").updateOne(
+    const transaction = await db
+      .collection("transactions")
+      .findOne({ sessionId: session.id }, { projection: { _id: 1 } });
+
+    const currentVendor = await db.collection("user").findOne(
+      { _id: vendorObjectId, role: "vendor" },
       {
-        _id: vendorObjectId,
-        role: "vendor",
-      },
-      {
-        $set: {
-          subscriptionPlan: "premium",
-          subscriptionExpiresAt: null,
-          updatedAt: new Date(),
+        projection: {
+          subscriptionPlan: 1,
+          subscriptionExpiresAt: 1,
         },
       }
     );
 
+    const premiumActivated = Boolean(
+      transaction &&
+        currentVendor?.subscriptionPlan === "premium" &&
+        currentVendor?.subscriptionExpiresAt
+    );
+
     return res.status(200).json({
       success: true,
-      message: "Premium subscription activated successfully",
+      message: premiumActivated
+        ? "Payment verified and Premium is active."
+        : "Payment verified. Premium activation is still being processed.",
       data: {
-        subscriptionPlan: "premium",
+        paymentVerified: true,
+        premiumActivated,
+        subscriptionPlan: currentVendor?.subscriptionPlan || "free",
+        subscriptionExpiresAt: premiumActivated
+          ? currentVendor?.subscriptionExpiresAt
+          : null,
       },
     });
   } catch (error) {
